@@ -1,0 +1,58 @@
+name: Build Mod
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.1.1
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.1.1
+
+      # Fixes "No settings.gradle found": handles the project being in a subfolder,
+      # or a zip that was uploaded without being extracted.
+      - name: Locate project
+        id: loc
+        run: |
+          if [ ! -f settings.gradle ] && [ -z "$(find . -name settings.gradle -not -path './.git/*' | head -n1)" ]; then
+            for z in *.zip; do
+              [ -f "$z" ] && unzip -o "$z" -d extracted_project && break
+            done
+          fi
+          FOUND=$(find . -name settings.gradle -not -path './.git/*' | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "::error::No settings.gradle found. Upload the EXTRACTED mod files (not the zip) to the repo root."
+            exit 1
+          fi
+          DIR=$(dirname "$FOUND")
+          echo "Project directory: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build jar
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: gradle build --no-daemon --stacktrace
+
+      - name: List output
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: ls -la build/libs
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: evilreal-mod-jar
+          path: ${{ steps.loc.outputs.dir }}/build/libs/*.jar
+          if-no-files-found: error
