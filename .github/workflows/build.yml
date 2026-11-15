@@ -1,4 +1,4 @@
-name: Build Mod
+name: Build AI Buddy mod
 
 on:
   push:
@@ -18,41 +18,43 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle 8.1.1
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: 8.1.1
-
-      # Fixes "No settings.gradle found": handles the project being in a subfolder,
-      # or a zip that was uploaded without being extracted.
+      # Finds settings.gradle wherever it is. If the repo only contains the
+      # uploaded .zip (instead of the extracted files), it extracts the zip first.
       - name: Locate project
-        id: loc
+        id: locate
+        shell: bash
         run: |
-          if [ ! -f settings.gradle ] && [ -z "$(find . -name settings.gradle -not -path './.git/*' | head -n1)" ]; then
-            for z in *.zip; do
-              [ -f "$z" ] && unzip -o "$z" -d extracted_project && break
+          set -e
+          S="$(find . -name settings.gradle -not -path './.git/*' | head -n 1)"
+          if [ -z "$S" ]; then
+            shopt -s nullglob
+            for z in ./*.zip; do
+              echo "Extracting $z"
+              unzip -q -o "$z" -d _unzipped
             done
+            S="$(find ./_unzipped -name settings.gradle 2>/dev/null | head -n 1)"
           fi
-          FOUND=$(find . -name settings.gradle -not -path './.git/*' | head -n1)
-          if [ -z "$FOUND" ]; then
-            echo "::error::No settings.gradle found. Upload the EXTRACTED mod files (not the zip) to the repo root."
+          if [ -z "$S" ]; then
+            echo "::error::No settings.gradle found. Upload the EXTRACTED contents of the zip (or the zip itself) to the repo."
+            ls -la
             exit 1
           fi
-          DIR=$(dirname "$FOUND")
+          DIR="$(dirname "$S")"
           echo "Project directory: $DIR"
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Build jar
-        working-directory: ${{ steps.loc.outputs.dir }}
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Build mod
+        working-directory: ${{ steps.locate.outputs.dir }}
         run: gradle build --no-daemon --stacktrace
 
-      - name: List output
-        working-directory: ${{ steps.loc.outputs.dir }}
-        run: ls -la build/libs
-
-      - name: Upload jar
+      - name: Upload mod jar
         uses: actions/upload-artifact@v4
         with:
-          name: reallife-mod-jar
-          path: ${{ steps.loc.outputs.dir }}/build/libs/*.jar
+          name: ai-buddy-mod-jar
+          path: ${{ steps.locate.outputs.dir }}/build/libs/*.jar
           if-no-files-found: error
