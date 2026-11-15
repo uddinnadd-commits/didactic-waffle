@@ -1,4 +1,4 @@
-name: Build AI Buddy mod
+name: Build mod
 
 on:
   push:
@@ -7,54 +7,115 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned so the ubuntu-latest -> Ubuntu 26 switch can't change the build.
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Check out repository
+        uses: actions/checkout@v6
         with:
-          distribution: temurin
-          java-version: '17'
+          fetch-depth: 0
 
-      # Finds settings.gradle wherever it is. If the repo only contains the
-      # uploaded .zip (instead of the extracted files), it extracts the zip first.
-      - name: Locate project
+      # Finds this project's settings.gradle wherever it is. If the project was uploaded
+      # as one or more .zip files (even with spaces in the name, like "x (1).zip"), they are
+      # unpacked first; when there are several, the most recently committed one wins.
+      - name: Find the project
         id: locate
         shell: bash
         run: |
           set -e
-          S="$(find . -name settings.gradle -not -path './.git/*' | head -n 1)"
-          if [ -z "$S" ]; then
-            shopt -s nullglob
-            for z in ./*.zip; do
-              echo "Extracting $z"
-              unzip -q -o "$z" -d _unzipped
-            done
-            S="$(find ./_unzipped -name settings.gradle 2>/dev/null | head -n 1)"
+          find_settings() {
+            local mine=""
+            mine="$(find . -name settings.gradle -not -path './.git/*' -print0 \
+              | xargs -0 -r grep -l "rootProject.name = 'tooperfect'" 2>/dev/null | head -n 1 || true)"
+            if [ -n "$mine" ]; then
+              echo "$mine"
+            else
+              find . -name settings.gradle -not -path './.git/*' -print -quit
+            fi
+          }
+
+          SETTINGS="$(find_settings)"
+          if [ -z "$SETTINGS" ]; then
+            echo "No settings.gradle yet - looking for zip files to unpack..."
+            while IFS= read -r -d '' z; do
+              ct="$(git log -1 --format=%ct -- "$z" 2>/dev/null || true)"
+              printf '%s\t%s\0' "${ct:-0}" "$z"
+            done < <(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -print0) \
+              | sort -z -n \
+              | while IFS=$'\t' read -r -d '' ct z; do
+                  echo "Unpacking: $z"
+                  unzip -o -q "$z" -d _unzipped
+                done
+            SETTINGS="$(find_settings)"
           fi
-          if [ -z "$S" ]; then
-            echo "::error::No settings.gradle found. Upload the EXTRACTED contents of the zip (or the zip itself) to the repo."
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No settings.gradle found. Upload the CONTENTS of the project (not the .zip itself) to the repo root."
             ls -la
             exit 1
           fi
-          DIR="$(dirname "$S")"
+          DIR="$(dirname "$SETTINGS")"
           echo "Project directory: $DIR"
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
         with:
-          gradle-version: '8.5'
+          gradle-version: '8.1.1'
 
-      - name: Build mod
+      - name: Build
         working-directory: ${{ steps.locate.outputs.dir }}
-        run: gradle build --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle build --no-daemon --stacktrace 2>&1 | tee build.log
 
-      - name: Upload mod jar
-        uses: actions/upload-artifact@v4
+      # If the build fails, pull the real error out of the log so it shows up in
+      # the run's Annotations and Summary instead of just "exit code 1".
+      - name: Show build errors
+        if: failure()
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          [ -f build.log ] || exit 0
+          {
+            echo "### Build failed - key lines from the log"
+            echo '```'
+            grep -nE "error:|cannot find symbol|does not exist|What went wrong|Could not|Execution failed|Caused by" build.log | head -n 40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "error:|What went wrong|Could not|Execution failed" -A2 build.log | head -n 15 | sed 's/%/%25/g' | while IFS= read -r line; do echo "::error::${line}"; done || true
+
+      - name: Collect jar
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          JAR="$(find build/libs -maxdepth 1 -name '*.jar' ! -name '*-sources.jar' ! -name '*-slim.jar' | head -n 1)"
+          if [ -z "$JAR" ]; then
+            echo "::error::Build finished but there is no jar in build/libs"
+            ls -la build/libs || true
+            exit 1
+          fi
+          cp "$JAR" dist/tooperfect.jar
+          ls -la dist
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v6
         with:
-          name: ai-buddy-mod-jar
-          path: ${{ steps.locate.outputs.dir }}/build/libs/*.jar
-          if-no-files-found: error
+          name: tooperfect-jar
+          path: ${{ steps.locate.outputs.dir }}/dist/tooperfect.jar
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log
+          path: ${{ steps.locate.outputs.dir }}/build.log
+          if-no-files-found: ignore
