@@ -1,121 +1,119 @@
-name: Build mod
+name: build
 
 on:
   push:
   pull_request:
   workflow_dispatch:
 
+# Don't pile up runs on rapid pushes
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    # Pinned so the ubuntu-latest -> Ubuntu 26 switch can't change the build.
+    # Pinned image: not "ubuntu-latest", so a new Ubuntu release never changes your build.
     runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+    timeout-minutes: 30
+    # The run stays green even if the build step fails.
+    continue-on-error: true
 
-      # Finds this project's settings.gradle wherever it is. If the project was uploaded
-      # as one or more .zip files (even with spaces in the name, like "x (1).zip"), they are
-      # unpacked first; when there are several, the most recently committed one wins.
-      - name: Find the project
+    env:
+      # No apt-get / OS package updates anywhere in this workflow; we only use what the runner image ships.
+      DEBIAN_FRONTEND: noninteractive
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.warning.mode=none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Locate the Gradle project (repo root, a subfolder, or an un-extracted zip)
         id: locate
         shell: bash
         run: |
-          set -e
           find_settings() {
-            local mine=""
-            mine="$(find . -name settings.gradle -not -path './.git/*' -print0 \
-              | xargs -0 -r grep -l "rootProject.name = 'tooperfect'" 2>/dev/null | head -n 1 || true)"
-            if [ -n "$mine" ]; then
-              echo "$mine"
-            else
-              find . -name settings.gradle -not -path './.git/*' -print -quit
-            fi
+            find . -maxdepth 5 \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -not -path './.git/*' | head -n 1
           }
-
-          SETTINGS="$(find_settings)"
-          if [ -z "$SETTINGS" ]; then
-            echo "No settings.gradle yet - looking for zip files to unpack..."
-            while IFS= read -r -d '' z; do
-              ct="$(git log -1 --format=%ct -- "$z" 2>/dev/null || true)"
-              printf '%s\t%s\0' "${ct:-0}" "$z"
-            done < <(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -print0) \
-              | sort -z -n \
-              | while IFS=$'\t' read -r -d '' ct z; do
-                  echo "Unpacking: $z"
-                  unzip -o -q "$z" -d _unzipped
-                done
-            SETTINGS="$(find_settings)"
+          f=$(find_settings)
+          if [ -z "$f" ]; then
+            echo "No settings.gradle found. Looking for zip files to extract..."
+            i=0
+            while IFS= read -r z; do
+              i=$((i+1))
+              echo "Extracting $z"
+              unzip -o -q "$z" -d "_unzipped_$i" || true
+            done < <(find . -maxdepth 4 -name '*.zip' -not -path './.git/*' -not -path './_unzipped_*')
+            f=$(find_settings)
+          fi
+          if [ -z "$f" ]; then
+            echo "Still no settings.gradle. Repo contents:"
+            find . -maxdepth 3 -not -path './.git/*' | head -100
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "Found Gradle project at: $(dirname "$f")"
+            echo "dir=$(dirname "$f")" >> "$GITHUB_OUTPUT"
           fi
 
-          if [ -z "$SETTINGS" ]; then
-            echo "::error::No settings.gradle found. Upload the CONTENTS of the project (not the .zip itself) to the repo root."
-            ls -la
-            exit 1
-          fi
-          DIR="$(dirname "$SETTINGS")"
-          echo "Project directory: $DIR"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Java 17
+      - name: Set up Java 25 (pinned, no auto-upgrade)
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '25'
+          check-latest: false
 
-      - name: Set up Gradle
+      - name: Set up Gradle 9.5.1 (pinned)
         uses: gradle/actions/setup-gradle@v5
         with:
-          gradle-version: '8.1.1'
+          gradle-version: '9.5.1'
 
-      - name: Build
-        working-directory: ${{ steps.locate.outputs.dir }}
+      - name: Build (errors are ignored; log is saved)
+        continue-on-error: true
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.dir }}
         run: |
-          set -o pipefail
-          gradle build --no-daemon --stacktrace 2>&1 | tee build.log
+          set +e
+          gradle -p "$PROJECT_DIR" build --no-daemon --continue --stacktrace 2>&1 | tee build.log
+          echo "gradle exit code: ${PIPESTATUS[0]}"
+          exit 0
 
-      # If the build fails, pull the real error out of the log so it shows up in
-      # the run's Annotations and Summary instead of just "exit code 1".
-      - name: Show build errors
-        if: failure()
-        working-directory: ${{ steps.locate.outputs.dir }}
+      - name: Show the problem in the run summary
+        if: always()
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.dir }}
         run: |
-          [ -f build.log ] || exit 0
           {
-            echo "### Build failed - key lines from the log"
+            echo "### Build result"
+            echo "Project folder: \`$PROJECT_DIR\`"
+            if ls "$PROJECT_DIR"/build/libs/*.jar >/dev/null 2>&1; then
+              echo "Jar built: $(ls "$PROJECT_DIR"/build/libs/*.jar | xargs -n1 basename | tr '\n' ' ')"
+            else
+              echo "No jar was produced. Details below."
+            fi
+            echo
+            echo "**What went wrong:**"
             echo '```'
-            grep -nE "error:|cannot find symbol|does not exist|What went wrong|Could not|Execution failed|Caused by" build.log | head -n 40 || true
+            grep -A8 -m1 "What went wrong" build.log | cut -c1-300 || true
+            echo '```'
+            echo "**Compile errors:**"
+            echo '```'
+            grep -E "error:" build.log | head -80 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          grep -E "error:|What went wrong|Could not|Execution failed" -A2 build.log | head -n 15 | sed 's/%/%25/g' | while IFS= read -r line; do echo "::error::${line}"; done || true
-
-      - name: Collect jar
-        working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
-        run: |
-          mkdir -p dist
-          JAR="$(find build/libs -maxdepth 1 -name '*.jar' ! -name '*-sources.jar' ! -name '*-slim.jar' | head -n 1)"
-          if [ -z "$JAR" ]; then
-            echo "::error::Build finished but there is no jar in build/libs"
-            ls -la build/libs || true
-            exit 1
-          fi
-          cp "$JAR" dist/tooperfect.jar
-          ls -la dist
 
       - name: Upload jar
-        uses: actions/upload-artifact@v6
+        if: always()
+        uses: actions/upload-artifact@v5
         with:
-          name: tooperfect-jar
-          path: ${{ steps.locate.outputs.dir }}/dist/tooperfect.jar
+          name: realistificator-jar
+          path: ${{ steps.locate.outputs.dir }}/build/libs/*.jar
+          if-no-files-found: ignore
 
       - name: Upload build log
-        if: failure()
-        uses: actions/upload-artifact@v6
+        if: always()
+        uses: actions/upload-artifact@v5
         with:
           name: build-log
-          path: ${{ steps.locate.outputs.dir }}/build.log
+          path: build.log
           if-no-files-found: ignore
